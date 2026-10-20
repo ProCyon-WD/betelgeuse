@@ -1,0 +1,15 @@
+# Shared dependencies for Python 3.12, not a standalone training environment.
+# Install requirements-mac.txt or requirements-cuda.txt instead.
+numpy==2.5.4
+Pillow==13.0.0
+scikit-learn==1.9.1
+scipy==1.18.1
+h5py==3.14.0
+matplotlib==3.11.2
+pandas==2.2.3
+tqdm==4.67.1
+PyYAML==6.0.3
+psutil==7.2.2
+tensorboard==2.21.0
+tensorflow-datasets==4.9.10
+tensorflow-metadata==1.21.0

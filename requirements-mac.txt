@@ -1,0 +1,9 @@
+# Python 3.12; Apple Silicon (arm64); macOS 14 or newer.
+# Native macOS PyTorch supports CPU/MPS, not CUDA.
+-r requirements.txt
+
+torch==2.14.1
+torchvision==0.29.1
+
+# Required by the legacy dataset loaders; no tensorflow-metal plugin is needed.
+tensorflow==2.21.0
