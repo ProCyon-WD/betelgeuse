@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as functional
 
 from experiments.recording import record_training_loss
+from experiments.local_training import local_batches, singleton_batchnorm, uses_local_epochs
 
 
 @torch.no_grad()
@@ -96,14 +97,17 @@ class BaselineClient:
     def train(self, global_model, args, round_index, logger=None):
         self._start_round(global_model)
         scaler = torch.amp.GradScaler("cuda", enabled=args.amp and self.device.type == "cuda")
-        iterator = iter(self.loader)
         losses = []
+        loss_weights = []
+        self.local_train_steps = 0
+        self.local_train_samples = 0
         accepted_samples = 0
         seen_samples = 0
-        for _ in range(args.local_iterations):
-            batch = next(iterator)
+        for batch in local_batches(self.loader, args):
+            batch_size = len(batch[0])
             self.optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(self.device.type, enabled=args.amp and self.device.type == "cuda"):
+            with torch.amp.autocast(self.device.type, enabled=args.amp and self.device.type == "cuda"), \
+                    singleton_batchnorm(self.model, uses_local_epochs(args) and batch_size == 1):
                 if self.tag_client_lbulb == 0:
                     images, targets = self._labeled_batch(batch)
                     logits = self.model(images.to(self.device))
@@ -117,7 +121,7 @@ class BaselineClient:
                     loss = self._unlabeled_weight() * loss
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite {} loss on client {}".format(args.method, self.id_user))
-            record_training_loss(self, loss)
+            record_training_loss(self, loss, batch_size if uses_local_epochs(args) else None)
             scaler.scale(loss).backward()
             if args.clip > 0:
                 scaler.unscale_(self.optimizer)
@@ -125,9 +129,14 @@ class BaselineClient:
             scaler.step(self.optimizer)
             scaler.update()
             self._after_step()
-            losses.append(float(loss.detach()))
+            self.local_train_steps += 1
+            self.local_train_samples += batch_size
+            weight = batch_size if uses_local_epochs(args) else 1
+            losses.append(float(loss.detach()) * weight)
+            loss_weights.append(weight)
         self.optimizer.zero_grad(set_to_none=True)
-        return {"client_id": self.id_user, "loss": sum(losses) / len(losses),
+        return {"client_id": self.id_user, "loss": sum(losses) / sum(loss_weights),
+                "train_steps": self.local_train_steps, "train_samples": self.local_train_samples,
                 "mask_ratio": accepted_samples / max(1, seen_samples),
                 "sample_count": self.num_samples, "aggregation_count": self.aggregation_count()}
 

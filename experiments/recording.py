@@ -17,17 +17,17 @@ from experiments.paths import project_path
 
 MIB = 1024 ** 2
 CURVE_FIELDS = (
-    "round", "train_loss", "train_steps", "nonfinite_loss_steps", "participating_clients",
+    "round", "train_loss", "train_steps", "train_samples", "nonfinite_loss_steps", "participating_clients",
     "labeled_train_loss", "unlabeled_train_loss", "mixed_train_loss",
     "training_time_seconds", "cumulative_training_time_seconds", "elapsed_time_seconds",
     "cpu_peak_rss_mib", "cpu_tree_peak_rss_mib", "cuda_peak_allocated_mib", "cuda_peak_reserved_mib",
 )
 
 
-def record_training_loss(client, loss):
+def record_training_loss(client, loss, sample_count=None):
     recorder = getattr(client, "training_recorder", None)
     if recorder is not None:
-        recorder.record_loss(client.id_user, client.tag_client_lbulb, loss)
+        recorder.record_loss(client.id_user, client.tag_client_lbulb, loss, sample_count)
 
 
 class TrainingRecorder:
@@ -188,13 +188,18 @@ class TrainingRecorder:
         self._sample_memory()
 
     @torch.no_grad()
-    def record_loss(self, client_id, tag, loss):
+    def record_loss(self, client_id, tag, loss, sample_count=None):
         if self._active_round is None:
             raise RuntimeError("Cannot record a training loss outside a training round")
         value = loss.detach().float().reshape(())
         key = (int(tag), str(value.device))
         finite = torch.isfinite(value)
-        contribution = torch.stack((torch.where(finite, value, torch.zeros_like(value)), (~finite).float()))
+        weight = 1 if sample_count is None else sample_count
+        if weight < 1:
+            raise ValueError("Loss sample_count must be positive")
+        contribution = torch.stack((torch.where(finite, value, torch.zeros_like(value)) * weight,
+                                    (~finite).float(), value.new_tensor(weight),
+                                    value.new_tensor(sample_count or 0)))
         if key not in self._losses:
             self._losses[key] = [contribution, 1]
         else:
@@ -215,21 +220,24 @@ class TrainingRecorder:
         self.training_time_seconds += duration
         self._sample_memory()
         allocated, reserved = self._capture_cuda_peaks()
-        totals = {tag: [0.0, 0, 0] for tag in (0, 1, 2)}
+        totals = {tag: [0.0, 0, 0, 0, 0] for tag in (0, 1, 2)}
         for (tag, _), (values, count) in self._losses.items():
-            total, nonfinite = values.cpu().tolist()
+            total, nonfinite, weight, samples = values.cpu().tolist()
             totals[tag][0] += total
             totals[tag][1] += count
             totals[tag][2] += int(nonfinite)
+            totals[tag][3] += weight
+            totals[tag][4] += int(samples)
 
         def mean_loss(statistics):
-            total, count, nonfinite = statistics
-            return total / count if count and not nonfinite and math.isfinite(total) else None
+            total, count, nonfinite, weight, samples = statistics
+            return total / weight if count and not nonfinite and math.isfinite(total) else None
 
-        combined = [sum(values[position] for values in totals.values()) for position in range(3)]
+        combined = [sum(values[position] for values in totals.values()) for position in range(5)]
         with self._lock:
             record = {"round": self._active_round, "train_loss": mean_loss(combined),
                       "train_steps": combined[1], "nonfinite_loss_steps": combined[2],
+                      "train_samples": combined[4] if getattr(self.args, "local_training_mode", "steps") == "epochs" else None,
                       "participating_clients": len(self._clients),
                       "labeled_train_loss": mean_loss(totals[0]),
                       "unlabeled_train_loss": mean_loss(totals[2]), "mixed_train_loss": mean_loss(totals[1]),
@@ -261,12 +269,15 @@ class TrainingRecorder:
                 "seed": self.seed, "device": str(self.device), "status": self.status,
                 "started_at": self.started_at, "finished_at": self.finished_at,
                 "expected_rounds": self.args.num_global_iters, "completed_rounds": len(self.rounds),
+                "local_training_mode": getattr(self.args, "local_training_mode", "steps"),
+                "local_epochs": getattr(self.args, "local_epochs", 1),
                 "training_time_seconds": self.training_time_seconds,
                 "total_time_seconds": (self.total_time_seconds if self.total_time_seconds is not None else
                                        time.perf_counter() - self._start_time),
                 "memory_footprint": memory, "measurement_errors": errors, "error_type": self.error_type,
                 "definitions": {
-                    "train_loss": "Equal-weight mean of actual unscaled minibatch objectives submitted to backward, including method coefficients; not validation loss or a full-dataset evaluation",
+                    "train_loss": ("Sample-weighted mean" if getattr(self.args, "local_training_mode", "steps") == "epochs" else "Equal-weight minibatch mean") + " of actual unscaled objectives submitted to backward, including method coefficients; not validation loss or a full-dataset evaluation",
+                    "train_samples": "Local sample visits in epoch mode, including repeat epochs; weak/strong views count once; null in steps mode",
                     "train_steps": "Number of objective observations, not guaranteed optimizer steps if AMP skips an update",
                     "training_time_seconds": "Client selection, local training, aggregation and existing in-round diagnostics; includes any recorded pretraining warmup and interrupted round; excludes server initialization, evaluation and metrics serialization",
                     "total_time_seconds": "Wall time from before server construction through process completion, including evaluation and periodic output; excludes final recorder serialization and teardown",

@@ -6,7 +6,7 @@ Betelgeuse 是一个面向图像分类的 **Federated Semi-Supervised Learning�
 
 > **先看运行边界**
 >
-> - 正式训练入口目前要求 NVIDIA CUDA；Mac 环境用于配置检查、数据准备和代码级 CPU 调试，不能直接通过 `train.py` 在 CPU/MPS 上训练。
+> - 默认训练设备为 NVIDIA CUDA。Mac 可通过 `--device cpu` 直接训练 ImageNet-100 的 FedCyon / FedPDM；其他组合的 CPU 入口和 MPS 尚未开放。
 > - ImageNet-100 已接入上述六种方法；ImageNet-1K 全量训练与 DomainNet 尚未接入。
 > - 新路径已做 CPU 小规模联调，不等于完成真实 GPU/AMP 验证或复现论文精度。
 > - 旧配置、旧评估和部分数据准备代码仍有历史限制。第 7、11 节列出了具体问题，不应把“有配置”理解为“所有组合都已完整测试”。
@@ -38,6 +38,7 @@ betelgeuse/
 │   ├── config.py                    参数解析、YAML 合并、方法注册与合法性检查
 │   ├── runner.py                    设备检查、随机种子、重复运行、服务器调度
 │   ├── paths.py                     项目相对路径、数据及结果目录
+│   ├── local_training.py            小图本地 steps/epochs 预算及单样本尾批处理
 │   └── recording.py                 耗时、内存、逐轮训练 loss 的统一记录
 ├── Server/
 │   ├── serverbase.py                公共服务端接口及旧评估流程
@@ -104,7 +105,7 @@ betelgeuse/
 train.py
   → experiments.config.parse_args()
   → experiments.runner.run()
-      → 解析配置、检查 CUDA、保存 resolved_config.json
+      → 解析配置、选择并检查 CPU/CUDA 设备、保存 resolved_config.json
       → 为每个 run 设置训练 seed，创建 TrainingRecorder
       → 构建对应 Server、加载或生成数据索引、创建 User
       → Server.process()
@@ -147,7 +148,7 @@ train.py
 
 **`--method` 选服务端流程；`name_algorithm` 选客户端数据视图/损失相关分支；`aggregate_method_server` 不是统一的方法选择器。** 不要只改后两个参数来切换方法。
 
-FedPDM 是独立重实现，仍采用项目的固定本地步数等工程设置。SAGE-Pure 适配了“纯有标签 / 纯无标签客户端”协议，不是原论文 Mixed 客户端设定的完整复现。方法参数、公式与差异记录在 `BASELINES.md`。
+FedPDM 是独立重实现，默认采用固定本地步数；CIFAR-10/SVHN 可选择完整本地 epoch（第 5.4 节）。SAGE-Pure 适配了“纯有标签 / 纯无标签客户端”协议，不是原论文 Mixed 客户端设定的完整复现。方法参数、公式与差异记录在 `BASELINES.md`。
 
 ### 2.2 数据集范围
 
@@ -166,7 +167,7 @@ FedPDM 是独立重实现，仍采用项目的固定本地步数等工程设置�
 
 以下命令除另有说明外，均在项目根目录执行。两套文件按仓库当前固定版本安装，不宣称这些版本是“最新版本”，也不要混装在同一个虚拟环境。
 
-### 3.1 Mac：配置和数据调试
+### 3.1 Mac：配置、数据调试与 CPU 训练
 
 目标：Python 3.12、Apple Silicon / arm64；依赖文件标注 macOS 14+。Intel Mac 不在这份环境的目标范围。
 
@@ -180,7 +181,23 @@ python -c "import torch, torchvision, psutil; print('torch:', torch.__version__)
 python train.py --method fedcyon --config config/experiments/ImageNet100_Fedcyon_label01.yaml --dry-run
 ```
 
-该文件固定 PyTorch `2.14.1`、torchvision `0.29.1`、TensorFlow `2.21.0`。TensorFlow 服务于旧数据加载，不安装 `tensorflow-metal`。即使检测到 MPS，项目也没有接通正式 MPS 训练；`--gpu -1` 不会切换为 CPU。
+该文件固定 PyTorch `2.14.1`、torchvision `0.29.1`、TensorFlow `2.21.0`。TensorFlow 服务于旧数据加载，不安装 `tensorflow-metal`。即使检测到 MPS，项目也没有接通 MPS 训练；`--gpu -1` 不会切换为 CPU，需要显式指定 `--device cpu`。
+
+环境安装后，可在 Mac 上依次运行 ImageNet-100 的两个方法：
+
+```sh
+python -u train.py --method fedcyon --config config/experiments/ImageNet100_Fedcyon_label01.yaml \
+  --device cpu --cpu_threads 4 --amp false \
+  --save_name "fedcyon_imagenet100_cpu_$(date +%Y%m%d_%H%M%S)"
+
+python -u train.py --method fedpdm --config config/experiments/ImageNet100_FedPDM_label01.yaml \
+  --device cpu --cpu_threads 4 --amp false \
+  --save_name "fedpdm_imagenet100_cpu_$(date +%Y%m%d_%H%M%S)"
+```
+
+两条命令保持原配置的 200 轮、20 客户端、每客户端每轮 5 步与 batch size 16，不修改目标函数、聚合或数据划分。只试跑时添加 `--num_global_iters 3 --eval_interval 1`。CPU 入口目前仅开放这两个 ImageNet-100 组合，拒绝 CPU AMP 和未经适配的组合；默认仍为 CUDA，不会静默回退到 CPU。
+
+长时间训练请接通电源、保持开盖，并可在 `python` 前加 `caffeinate -i` 防止运行期间空闲休眠。指标保存在 `outputs/metrics/imagenet100/<save_name>/`，包括 `run_1_training.json` 和 `run_1_training.csv`；每次更换实验名可以避免覆盖。当前索引训练路径不支持 checkpoint 恢复，结束进程后不能从中断轮次续跑。
 
 不要把临时 `/tmp` 调试环境当作项目的长期运行环境。
 
@@ -248,6 +265,58 @@ data/datasource/imagenet100/
 `nXXXXXXXX` 是示意，实际使用 `config/datasets/imagenet100_cmc.txt` 中的 synset。类别文件必须恰好包含 100 个不重复类别，文件顺序决定标签编号。每个选中类别都需要训练和验证图像；额外类别不会加入训练。
 
 本地工作副本已有社区镜像数据，来源记录见 `data/datasource/imagenet100/source.json`：126,689 张训练图、5,000 张验证图，原图文件总计约 8.47 GB（十进制）。该记录注明不是官方直接下载，未确认与官方原图逐字节相同。**数据目录被 Git 忽略，换机器或拿到源码副本后不能假设数据也在。** 不会通过 `--prepare-data` 自动下载 ImageNet。
+
+#### 不经过 GitHub Release 下载
+
+在项目根目录、已激活的 Conda 环境中运行：
+
+```sh
+python scripts/download_imagenet100.py --dry-run
+python -u scripts/download_imagenet100.py
+
+python train.py --method fedpdm --config config/experiments/ImageNet100_FedPDM_label01.yaml --prepare-data
+```
+
+脚本直接读取 Hugging Face 的 `asafaa/imagenet100-cmc` 社区数据仓库，不需要 GitHub 账号、GitHub token、CUDA 或额外的 Hugging Face Python 包。源版本固定为 `6cc705b814f3a19af8e801d25bb55995ef0ce13e`；下载清单、每卷 SHA256、类别顺序和每类图片数量在 `config/datasets/imagenet100_download.json`，与本项目原有数据包使用的版本一致。下载和解压只使用 Python 标准库；可选的图像解码检查使用环境已有的 Pillow。
+
+- 默认下载训练集和验证集，不采样、不缩放、不重新编码图片；完成后应为 126,689 train + 5,000 val，类别顺序对应 `imagenet100_cmc.txt`。
+- 原图存到 `data/datasource/imagenet100/`，压缩包缓存到 `data/downloads/imagenet100/`。压缩包约 7.90 GiB，图像与缓存合计建议预留至少 20 GiB，Python 环境和其他输出另计。
+- 每个 ZIP 完成后先校验字节数和 SHA256，再安全解压并检查图片 CRC。再次运行会校验并复用已完成的文件；网络中断保留 `.part` 并尝试 HTTP Range 续传，源站不支持 Range 时仅重下当前分卷。
+- 不同内容的已有同名图片会明确报错，不自动覆盖。不允许路径穿越、符号链接、重复图片和清单外类别。全部归档提取后，检查精确图片路径及每类 train/val 数量，成功后写入 `download_manifest.json`；首次下载还会创建 `source.json`。
+- 校验失败的缓存不会被当作成功结果。按报错移动损坏的 ZIP / `.part` 后重试；单纯网络中断直接重跑同一条命令即可。不要同时向同一输出目录或缓存目录下载。
+
+若服务器无法访问 Hugging Face，可以**显式选择**可访问的 HTTPS 镜像。例如：
+
+```sh
+python -u scripts/download_imagenet100.py --endpoint https://hf-mirror.com
+```
+
+这不是自动切换或可用性保证；两种端点始终使用同一固定版本和强制 SHA256 校验。若两处都不可达，需要配置服务器网络/代理或手动传输数据，脚本不能绕过网络限制。HTTP 401/403/404 会明确停止，不绕过权限限制，也不会自动发送账号 token。
+
+自定义服务器数据盘位置，并在下载后逐张解码检查：
+
+```sh
+python -u scripts/download_imagenet100.py \
+  --output /mnt/datasets/imagenet100 \
+  --cache-dir /mnt/download-cache/imagenet100 \
+  --verify-images
+
+python train.py --method fedpdm --config config/experiments/ImageNet100_FedPDM_label01.yaml \
+  --datadir /mnt/datasets/imagenet100 --prepare-data
+```
+
+之后的所有训练命令也要添加同一个 `--datadir`。下载和检查不会重新划分训练/验证集，也不会修改客户端索引；客户端索引仍由 `--prepare-data` 建立或复用。
+
+只检查已经存在的数据、不联网：
+
+```sh
+python scripts/download_imagenet100.py --verify-only
+python scripts/download_imagenet100.py --verify-only --verify-images
+```
+
+`--verify-only` 检查布局和每类数量；加 `--verify-images` 会额外完整 RGB 解码。**离线检查不是与上游原始字节逐一比对**；归档 SHA256 和图片 CRC 的比对发生在正常下载/复用归档流程中。
+
+这是社区镜像，不是 ImageNet 官方下载服务；上游 license 元数据为 `other`，没有确认额外公开再分发授权。请遵守原始数据使用条款，不要将下载数据再次公开发布。脚本只覆盖 ImageNet-100；CIFAR-10/SVHN 的官方下载方式见第 4.5 节。
 
 若验证图像平铺在 `val/`，准备两列文本映射，每行是相对 `val/` 的路径和 synset，例如：
 
@@ -363,10 +432,13 @@ PYTHON=/path/to/venv/bin/python /path/to/betelgeuse/scripts/run.sh --method fedc
 
 | 参数 | 用途 / 注意事项 |
 | --- | --- |
+| `--device cpu` / `--device cuda` | 默认 CUDA；CPU 仅开放 ImageNet-100 的 FedCyon / FedPDM |
+| `--cpu_threads 4` | CPU 训练的 PyTorch intra-op 线程数，须为正数 |
 | `--gpu 0` | 当前可见设备中的 CUDA 编号；不是 CPU 开关 |
 | `--num_global_iters` | 通信轮数；ImageNet 配置为 200，很多旧配置为 2000 |
-| `--local_iterations` | 本地更新的步数预算，不等价于遍历一遍本地数据 |
-| `--local_epochs` | 旧算法使用方式各异；ImageNet 新基线要求为 1 |
+| `--local_training_mode steps\|epochs` | 默认 `steps`；`epochs` 仅支持 CIFAR-10/SVHN 的 FedCyon、FedPDM、SAGE-Pure |
+| `--local_iterations` | `steps` 模式每次参与的本地 minibatch 步数；`epochs` 模式忽略 |
+| `--local_epochs` | `epochs` 模式每次参与完整遍历本地数据的次数；单独修改此参数不会启用 epoch 模式 |
 | `--num_total_users` / `--num_subset_users` | 总客户端数 / 参与数；旧流程有硬编码限制 |
 | `--batch_size` / `--uratio` | 基础 batch 大小 / 无标签 batch 比例 |
 | `--eval_batch_size` | 评估 batch 大小 |
@@ -387,6 +459,54 @@ PYTHON=/path/to/venv/bin/python /path/to/betelgeuse/scripts/run.sh --method fedc
 默认 `overwrite=false`，但很多旧 YAML 写的是 `overwrite: store_true`。建议命令中显式写 `--overwrite false`，并为每次不同实验设置新名称。
 
 `--overwrite true` 允许写入同名输出，**不是恢复训练**，也不会先递归删除目录。新 run 统计按 run 编号区分；旧 `.npy` 评估指标往往不包含 `save_name` 或 run 编号，因此仅改实验名称不能完全避免覆盖。
+
+### 5.4 CIFAR-10 / SVHN 按本地 epoch 训练
+
+仅为 **FedCyon、FedPDM、SAGE-Pure** 开放。配置默认仍为固定步数；旧命令和 ImageNet-100 不变。
+
+- `--num_global_iters R`：通信 `R` 轮，每轮仍选择客户端、下发模型、本地训练、聚合。
+- `--local_training_mode epochs --local_epochs E`：每个**被选中**的客户端训练 `E` 个本地 epoch。
+  每个 epoch 独立打乱、无放回遍历自己的所有样本；不是对整个联邦数据集同步遍历。
+- 有标签客户端 batch 为 `batch_size`，无标签客户端为 `batch_size * uratio`。
+  每次参与的批次数为 `E * ceil(客户端样本数 / 对应 batch 大小)`；不丢最后一个不完整 batch。
+  只有 BatchNorm 的单通道统计量不足两个值时，临时使用 running statistics，之后恢复训练状态。
+- `local_iterations` 在此模式不参与训练预算。仅设置 `local_epochs` 不足以切换模式；
+  例如旧 SVHN FedCyon YAML 的 `local_epochs: 2` 在默认 steps 模式下仍维持原行为。
+- 不改变数据划分、本地 objective、teacher/prediction memory 的生命周期或服务器聚合公式。
+  FedCyon 的 TA 按实际访问样本数归一化；FedPDM 的无标签聚合计数仍为本轮最后一次通过阈值的去重样本数，
+  不因多个 epoch 重复加权。FedCyon 学习率调度仍每通信轮更新；两个新基线仍使用原固定学习率。
+
+在 CUDA 服务器、项目根目录中运行（数据准备见第 4 节；先用 `--dry-run` 核对配置）：
+
+```sh
+python train.py --method fedcyon --config config/experiments/CIFAR10_Fedcyon_label01.yaml \
+  --gpu 0 --local_training_mode epochs --local_epochs 1 --num_global_iters 100 \
+  --save_name cifar10_fedcyon_e1 --metrics_dir outputs/metrics/cifar10_fedcyon_e1 --overwrite false
+
+python train.py --method fedpdm --config config/experiments/CIFAR10_FedPDM_label01.yaml \
+  --gpu 0 --local_training_mode epochs --local_epochs 1 --num_global_iters 100 \
+  --save_name cifar10_fedpdm_e1 --metrics_dir outputs/metrics/cifar10_fedpdm_e1 --overwrite false
+
+python train.py --method sage --config config/experiments/CIFAR10_SAGE_label01.yaml \
+  --gpu 0 --local_training_mode epochs --local_epochs 1 --num_global_iters 100 \
+  --save_name cifar10_sage_e1 --metrics_dir outputs/metrics/cifar10_sage_e1 --overwrite false
+```
+
+换成 SVHN：把配置文件名前缀 `CIFAR10_` 改为 `SVHN_`，同时给 `save_name`、`metrics_dir` 换独立名称。
+多个本地 epoch 例如 `--local_epochs 2`；短测用 `--num_global_iters 3`。
+100 轮只是命令示例，不是推荐的收敛预算。完整 epoch 可能比原来的每轮 5 步慢很多；
+如果只抽取部分客户端，100 轮 × 1 个本地 epoch **不代表每个客户端都训练了 100 个 epoch**。
+FedCyon 仍沿用 20/50/100 客户端及 10% 有标签的旧协议；不要用 `num_labeled_users` 改旧路径的分组。
+
+逐轮资源统计仍保存；epoch 模式额外记录实际样本访问数 `train_samples`，并按样本数加权 `train_loss`，
+避免尾批被过度加权。`train_steps` 记录实际目标观测次数；AMP 跳过更新时它不等于成功 optimizer 更新次数。
+FedCyon 的梯度方差诊断使用梯度和/平方和计算同一个量，不保留整个 epoch 的全部梯度向量。
+方法原有分组 loss 日志仍是组内客户端均值，不应与统一 recorder 的逐样本均值混淆。
+
+2026-11-06 本地 CPU 验证：六个组合均用真实小批图像和实际 ResNet18/VGG19-BN 客户端跑了 3 次参与，
+覆盖 1/2 个本地 epoch、不同客户端长度、单样本尾批、TA 和 loss 归一化；六个固定步数回归也通过。
+另外以轻量模型运行六组合 × 1/2 epoch × 3 通信轮，验证客户端选择、聚合及 JSON/CSV/NPZ 落盘。
+FedCyon 的 CUDA 构造操作仅在验证进程中重定向到 CPU；未开放小图 CPU CLI，未验证 CUDA/AMP 或正式精度。
 
 ## 6. ImageNet-100：六个方法的实验步骤
 
@@ -616,7 +736,7 @@ tail -f outputs/logs/sage_imagenet100_background.log
 
 ### 8.4 对照前的核对表
 
-比较六种方法时，至少固定：数据及类别列表、实际客户端索引、标注客户端、模型及预训练设置、通信轮数、本地步数、batch 大小、评估频率、训练 seed 集合。显式旧缓存不受新 `partition_seed` 控制；需比较实际索引。RSCFed 还应报告子组重复训练次数。新旧 SVHN 的评估 split 不同，必须统一后才能报告精度对照。
+比较六种方法时，至少固定：数据及类别列表、实际客户端索引、标注客户端、模型及预训练设置、通信轮数、本地训练预算模式及步数/epoch 数、batch 大小、评估频率、训练 seed 集合。不能把相同通信轮数下的固定 5 步与完整 epoch 当作等量计算。显式旧缓存不受新 `partition_seed` 控制；需比较实际索引。RSCFed 还应报告子组重复训练次数。新旧 SVHN 的评估 split 不同，必须统一后才能报告精度对照。
 
 阈值和损失是方法的一部分，应报告各自设置。不同方法 loss 的定义和尺度不同，不能仅根据 train loss 更小判定算法更好；效果应看相同评估协议下的 Accuracy 等指标。资源比较还需统一设备、AMP、workers、评估和诊断设置。
 
@@ -655,6 +775,7 @@ outputs/metrics/imagenet100/fedpdm_imagenet100_runA/
 | --- | --- |
 | `train_loss` | 该轮实际本地 minibatch 的完整优化目标平均值，未做 GradScaler 缩放 |
 | `train_steps` | 实际观测的目标次数，不是 AMP 成功更新次数保证 |
+| `train_samples` | epoch 模式的实际样本访问次数（多 epoch 重复计数、weak/strong 只计一次）；steps 模式缺失 |
 | `labeled_train_loss` / `unlabeled_train_loss` / `mixed_train_loss` | 按客户端类型分组的完整目标均值 |
 | `training_time_seconds` | 逐轮训练阶段耗时；JSON 顶层为训练阶段累计耗时 |
 | `cumulative_training_time_seconds` | 截至本轮的累计训练阶段耗时 |
@@ -664,7 +785,7 @@ outputs/metrics/imagenet100/fedpdm_imagenet100_runA/
 
 CPU 每 0.1 秒和阶段边界采样，可能遗漏短暂尖峰；进程树 RSS 可能重复计入共享页。CUDA 记录不等于整张卡的全部使用量。单位统一为 MiB。CPU 调试时 CUDA 数据缺失，不伪造为 0。
 
-`train_loss` 包含真实使用的损失系数，不是最后一个 batch，也不是全局评估 loss。空轮或非有限目标使用缺失值，并记录相关计数。CBAFed 初始预训练单独记入 JSON 的 `warmup`，计入总训练时间但不混入正式通信轮次曲线。
+`train_loss` 包含真实使用的损失系数，不是最后一个 batch，也不是全局评估 loss。默认 steps 模式按 minibatch 等权平均，epochs 模式按实际样本数加权。空轮或非有限目标使用缺失值，并记录相关计数。CBAFed 初始预训练单独记入 JSON 的 `warmup`，计入总训练时间但不混入正式通信轮次曲线。
 
 每完成一轮原子替换文件，包含所有已完成轮次。正常结束为 `completed`，未完成为 `incomplete`，可捕获错误/键盘中断为 `failed` / `interrupted`；强制杀死进程或断电可能只留下 `running` 和此前已经保存的轮次。具体测量边界见 `TRAINING_METRICS.md`。
 
@@ -738,7 +859,7 @@ python -m datautils.migrate_partitions verify --partition cifar10_20_noniid-labe
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| Mac 正式训练提示需要 CUDA | 入口尚不支持 CPU/MPS；本机用 `--dry-run`、`--prepare-data`，正式实验移到 CUDA 服务器 |
+| Mac 训练提示需要 CUDA | ImageNet-100 的 FedCyon / FedPDM 加 `--device cpu --amp false`；其他组合仍需 CUDA，MPS 未接入 |
 | `Model directory already exists` | 使用新 `save_name`；确认确实允许覆盖时才用 `--overwrite true` |
 | `--dry-run` 成功，训练仍失败 | dry-run 不导入训练框架、不检查原始数据、缓存可用性或 CUDA |
 | 配置叫 CIFAR100/STL10，实际跑 CIFAR10 | 部分旧 `*_Client20.yaml` 的字段有复制残留；检查解析 JSON，不按名字推断 |

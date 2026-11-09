@@ -1,5 +1,6 @@
 import os
 from experiments.paths import log_directory, metrics_directory
+from experiments.local_training import local_loader_options, uses_local_epochs
 from datautils.partition_store import load_partition, partition_directory, partition_exists, save_partition
 
 import torch
@@ -114,7 +115,7 @@ class Balanced(Server):
                 dset_dict = {'train_lb': lb_dset, 'train_ulb': ulb_dset}
                 loader_dict['train_lb'] = get_data_loader(dset_dict['train_lb'],
                                                           args.batch_size,
-                                                          num_iters=1048576,
+                                                          **local_loader_options(args, 1048576),
                                                           data_sampler=args.train_sampler,
                                                           num_workers=args.num_workers)
 
@@ -128,7 +129,7 @@ class Balanced(Server):
                 loader_dict['train_lb'] = None
                 loader_dict['train_ulb'] = get_data_loader(dset_dict['train_ulb'],
                                                            args.batch_size * args.uratio,
-                                                           num_iters=1048576,
+                                                           **local_loader_options(args, 1048576),
                                                            data_sampler=args.train_sampler,
                                                            num_workers=args.num_workers)
 
@@ -308,7 +309,7 @@ class Balanced(Server):
         for glob_iter in range(self.num_global_iters):
             supervisedloss=0
             unsupervisedloss=0
-            localvariance = 0
+            localvariance = 0.0
             self.logger.warning(f"-------------Round number: {glob_iter} -------------")
             print(f"-------------Round number: {glob_iter} -------------")
 
@@ -390,10 +391,14 @@ class Balanced(Server):
 
 
 
-            supervisedloss=supervisedloss/self.users[0].local_iterations
-            unsupervisedloss=unsupervisedloss/self.users[0].local_iterations
-            supervisedloss=supervisedloss/self.split_client[0]
-            unsupervisedloss=unsupervisedloss/self.split_client[2]
+            if uses_local_epochs(self.args):
+                supervisedloss = supervisedloss / len(sam_label_clients)
+                unsupervisedloss = unsupervisedloss / len(sam_unlabel_clients)
+            else:
+                supervisedloss=supervisedloss/self.users[0].local_iterations
+                unsupervisedloss=unsupervisedloss/self.users[0].local_iterations
+                supervisedloss=supervisedloss/self.split_client[0]
+                unsupervisedloss=unsupervisedloss/self.split_client[2]
             self.logger.warning(f"Supervisedloss: {supervisedloss}")
             self.logger.warning(f"Unsupervisedloss: {unsupervisedloss}")
             self.supervisedloss.append(supervisedloss.cpu().detach().numpy())

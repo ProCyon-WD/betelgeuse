@@ -74,6 +74,8 @@ class ImageNet100Baseline(ImageNet100FedCyon):
                 "aggregation": "online models, sample-count-weighted FedAvg; no FedCyon TA weights",
                 "schedule": "fixed local_iterations, constant lr; no cross-client optimizer sharing",
             }
+        if getattr(self.args, "local_training_mode", "steps") == "epochs":
+            self.implementation["schedule"] = "full local_epochs without replacement per participation, constant lr; final partial batches retained"
         self.implementation["optimizer_state"] = "per-client, retained across rounds on CPU"
         self.implementation["integer_buffers"] = "taken from the largest-weight client (first wins ties)"
         self.implementation["protocol"] = "pure_clients"

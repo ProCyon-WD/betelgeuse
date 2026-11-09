@@ -15,6 +15,7 @@ from User.fixmatch_utils import consistency_loss, Get_Scalar
 # from datasets.data_utils import get_data_loader
 
 from User.userbase import User
+from experiments.local_training import local_batches, singleton_batchnorm, uses_local_epochs
 
 class UserReweight_mycb(User):
     def __init__(self, id_user, tag_client_lbulb, lb_dset, ulb_dset, loader_dict, model, args, logger, device, aggregate_method_server,
@@ -136,9 +137,9 @@ class UserReweight_mycb(User):
         
         if self.cpu_client_state:
             self.move_training_state(self.device)
-            if self.train_lb_dataloader is not None:
+            if self.train_lb_dataloader is not None and not uses_local_epochs(args):
                 self.train_lb_iterator = iter(self.train_lb_dataloader)
-            if self.train_ulb_dataloader is not None:
+            if self.train_ulb_dataloader is not None and not uses_local_epochs(args):
                 self.train_ulb_iterator = iter(self.train_ulb_dataloader)
         self.model.load_state_dict(down_model.state_dict())
         self.supervisedloss=0
@@ -148,6 +149,12 @@ class UserReweight_mycb(User):
         self.mask_ratio = 0.0
         self.model.train()
         grads = []
+        gradient_moments = []
+        epoch_mode = uses_local_epochs(args)
+        if epoch_mode and self.tag_client_lbulb not in (0, 2):
+            raise ValueError("FedCyon epoch mode supports pure labeled/unlabeled clients only")
+        self.local_train_steps = 0
+        self.local_train_samples = 0
 
 
         if self.tag_client_lbulb == 0:
@@ -159,8 +166,7 @@ class UserReweight_mycb(User):
 
 
 
-                for iiii in range(self.local_iterations):
-                    _, x_o, x_lb, y_lb=next(self.train_lb_iterator)
+                for _, x_o, x_lb, y_lb in local_batches(self.train_lb_dataloader, args, None if epoch_mode else self.train_lb_iterator):
                 #for _, x_o, x_lb, y_lb in self.loader_dict['train_lb']:
 
                     num_lb = x_lb.shape[0]
@@ -176,7 +182,7 @@ class UserReweight_mycb(User):
                     inputs = x_o
 
                     # inference and calculate sup/unsup losses
-                    with amp_cm():
+                    with amp_cm(), singleton_batchnorm(self.model, epoch_mode and num_lb == 1):
                         logits = self.model(inputs)
                         logits_x_lb = logits[:num_lb]
                         self.calculate_ta(logits_x_lb,self.local_iterations,num_lb)
@@ -200,7 +206,7 @@ class UserReweight_mycb(User):
                         total_loss = sup_loss
 
                     # parameter updates
-                    self.record_training_loss(total_loss)
+                    self.record_training_loss(total_loss, num_lb if epoch_mode else None)
                     if args.amp:
                         scaler.scale(total_loss).backward()
                         if (args.clip > 0):
@@ -217,14 +223,19 @@ class UserReweight_mycb(User):
                             for param in self.model.parameters():
                                 model_grad = param.grad.detach().view(-1) if not len(model_grad) else torch.cat(
                                     (model_grad, param.grad.detach().view(-1)))
-                            grads.append(model_grad)
+                            if epoch_mode:
+                                gradient_moments.append((model_grad.sum(), model_grad.square().sum(), model_grad.numel()))
+                            else:
+                                grads.append(model_grad)
                         self.optimizer.step()
 
 
                     # self.scheduler.step()
                     self.ema.update()
                     self.model.zero_grad()
-                    self.supervisedloss=self.supervisedloss+sup_loss
+                    self.local_train_steps += 1
+                    self.local_train_samples += num_lb
+                    self.supervisedloss=self.supervisedloss+sup_loss.detach() * (num_lb if epoch_mode else 1)
 
         elif self.tag_client_lbulb == 2:
 
@@ -241,8 +252,7 @@ class UserReweight_mycb(User):
 
                 classwise_acc = torch.zeros((args.num_classes,)).to(self.device)
 
-                for iiii in range(self.local_iterations):
-                    x_ulb_idx, x_ulb_w, x_ulb_s=next(self.train_ulb_iterator)
+                for x_ulb_idx, x_ulb_w, x_ulb_s in local_batches(self.train_ulb_dataloader, args, None if epoch_mode else self.train_ulb_iterator):
 
                 #for (x_ulb_idx, x_ulb_w, x_ulb_s) in self.loader_dict['train_ulb']:
                     # num_lb = x_lb.shape[0]
@@ -280,11 +290,13 @@ class UserReweight_mycb(User):
 
                         # total_loss = sup_loss + self.lambda_u * unsup_loss
                         total_loss = unsup_loss
-                        if self.cpu_client_state:
+                        if epoch_mode:
+                            self.mask_ratio += mask.detach().item() * num_ulb
+                        elif self.cpu_client_state:
                             self.mask_ratio += mask.detach().item() / self.local_iterations
 
                     # parameter updates
-                    self.record_training_loss(total_loss)
+                    self.record_training_loss(total_loss, num_ulb if epoch_mode else None)
                     if args.amp:
                         scaler.scale(total_loss).backward()
                         if (args.clip > 0):
@@ -301,13 +313,18 @@ class UserReweight_mycb(User):
                             for param in self.model.parameters():
                                 model_grad = param.grad.detach().view(-1) if not len(model_grad) else torch.cat(
                                     (model_grad, param.grad.detach().view(-1)))
-                            grads.append(model_grad)
+                            if epoch_mode:
+                                gradient_moments.append((model_grad.sum(), model_grad.square().sum(), model_grad.numel()))
+                            else:
+                                grads.append(model_grad)
                         self.optimizer.step()
 
                     #self.scheduler.step()
                     self.ema.update()
                     self.model.zero_grad()
-                    self.unsupervisedloss=self.unsupervisedloss+unsup_loss
+                    self.local_train_steps += 1
+                    self.local_train_samples += num_ulb
+                    self.unsupervisedloss=self.unsupervisedloss+unsup_loss.detach() * (num_ulb if epoch_mode else 1)
 
         else:
 
@@ -385,6 +402,18 @@ class UserReweight_mycb(User):
                     self.supervisedloss=self.supervisedloss+sup_loss
                     self.unsupervisedloss=self.unsupervisedloss+self.lambda_u * unsup_loss
 
+        if epoch_mode:
+            if self.local_train_samples == 0:
+                raise ValueError("Epoch training requires a nonempty local dataset")
+            self.ta = self.ta / self.local_train_samples
+            self.supervisedloss = self.supervisedloss / self.local_train_samples
+            self.unsupervisedloss = self.unsupervisedloss / self.local_train_samples
+            self.mask_ratio = self.mask_ratio / self.local_train_samples
+            if gradient_moments:
+                mean = sum(total for total, squared, count in gradient_moments) / sum(count for total, squared, count in gradient_moments)
+                self.maxlocalvariance = torch.stack([
+                    squared - 2 * mean * total + count * mean.square()
+                    for total, squared, count in gradient_moments]).clamp_min(0).max()
         self.scheduler.step()
         if grads:
             tensor_grads=torch.stack(grads,0)
@@ -396,7 +425,7 @@ class UserReweight_mycb(User):
 
 
         per_accs = 0
-        loss = total_loss.item()
+        loss = float(self.supervisedloss + self.unsupervisedloss) if epoch_mode else total_loss.item()
         return self.model, per_accs, loss
 
     @torch.no_grad()
@@ -438,7 +467,10 @@ class UserReweight_mycb(User):
         max_probs, max_idx = torch.max(pseudo_label, dim=-1)
         selected=max_probs.ge(self.ta_threshold).float()
         summation=torch.sum(selected)
-        self.ta=self.ta+summation/(local_iterations*batchsize)
+        if uses_local_epochs(self.args):
+            self.ta = self.ta + summation
+        else:
+            self.ta = self.ta + summation / (local_iterations * batchsize)
 
 
 def str2bool(v):

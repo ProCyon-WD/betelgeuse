@@ -2,12 +2,23 @@
 
 import gc
 import importlib
-import logging
 import os
 import random
 
 from experiments.config import SERVER_TYPES, configuration_json, parse_args, server_type_spec
 from experiments.paths import PROJECT_ROOT, project_path, source_directory
+
+
+def resolve_training_device(args):
+    import torch
+
+    if args.device == "cpu":
+        torch.set_num_threads(args.cpu_threads)
+        return torch.device("cpu")
+    if not torch.cuda.is_available() or args.gpu < 0:
+        raise RuntimeError("CUDA training requires a CUDA-enabled PyTorch installation and --gpu >= 0. "
+                           "For FedCyon/FedPDM on ImageNet-100 on a Mac, use --device cpu --amp false.")
+    return torch.device("cuda:{}".format(args.gpu))
 
 
 def run(args):
@@ -24,22 +35,23 @@ def run(args):
         raise ValueError("Resume of training requires --load_path")
     if save_path.exists() and not args.overwrite:
         raise FileExistsError("Model directory already exists: {}".format(save_path))
-    if not torch.cuda.is_available() or args.gpu < 0:
-        raise RuntimeError("The current server implementations require a CUDA-enabled PyTorch installation and --gpu >= 0.")
+    device = resolve_training_device(args)
     module_name, class_name = server_type_spec(args)
     server_type = getattr(importlib.import_module(module_name), class_name)
     save_path.mkdir(parents=True, exist_ok=True)
     (save_path / "resolved_config.json").write_text(configuration_json(args) + "\n", encoding="utf-8")
-    device = torch.device("cuda:{}".format(args.gpu))
     logger = get_logger(args.save_name, str(save_path), "WARNING")
-    logger.warning("USE GPU: %s for training", args.gpu)
+    logger.warning("USE DEVICE: %s for training", device)
+    if device.type == "cpu":
+        logger.warning("CPU intra-op threads: %s", torch.get_num_threads())
     for current_run in range(1, args.runtimes + 1):
         logger.warning("---------------Running time:------------ %s", current_run)
         seed = current_run + seed_offset
         random.seed(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
-        torch.backends.cudnn.deterministic = True
+        if device.type == "cuda":
+            torch.backends.cudnn.deterministic = True
         server_args = [args, logger, device, args.aggregate_method_server, args.name_algorithm,
                        args.name_data_total, args.name_net, args.name_optimizer, current_run,
                        args.dataset, str(datadir), args.partition,
@@ -48,7 +60,8 @@ def run(args):
             server_args.append(args.noise)
         server = None
         gc.collect()
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         try:
             with TrainingRecorder(args, device, current_run, seed) as recorder:
                 server = server_type(*server_args)
@@ -57,7 +70,7 @@ def run(args):
         finally:
             del server
             gc.collect()
-        logging.warning("GPU %s training is FINISHED", args.gpu)
+        logger.warning("Device %s training is FINISHED", device)
 
 
 def cli(argv=None, method=None):

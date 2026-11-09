@@ -74,16 +74,31 @@ CUDA 使用 PyTorch peak counters，不等于 `nvidia-smi` 所示全设备用量
 每轮重置 CUDA 峰值计数器前先合并已有峰值，因此总 run 峰值不会因逐轮重置而丢失。
 每次重复训练结束释放上一个服务器，下一次开始前清理未使用的 CUDA 缓存；
 已加载的 Python/库内存仍可能保留，不保证多个 run 拥有完全相同的内存基线。
-CPU 调试时 CUDA 字段为 JSON `null` / CSV 空值 / NPZ `NaN`，**不是伪造为0**。
+CPU 训练或调试时 CUDA 字段为 JSON `null` / CSV 空值 / NPZ `NaN`，**不是伪造为0**。
 采样数量、间隔和权限/采样异常也记录在 JSON 中。
 
 ## 每轮 train loss
 
-`train_loss` 是该轮所有实际本地训练 minibatch 的 **total objective 算术平均值**：
+默认 `steps` 模式的 `train_loss` 是该轮所有实际本地训练 minibatch 的 **total objective 算术平均值**：
 
 ```text
 train_loss(round) = sum(actual_total_loss_of_each_local_batch) / train_steps
 ```
+
+CIFAR-10/SVHN 的 FedCyon、FedPDM、SAGE-Pure 可通过
+`--local_training_mode epochs --local_epochs E` 切换为完整本地 epoch。该模式保留尾批，
+所以 `train_loss` 和按客户端类型分组的 loss 都按**该批实际样本数**加权：
+
+```text
+train_loss(round) = sum(batch_objective * batch_sample_count) / train_samples
+```
+
+`train_samples` 是该轮所有参与客户端的样本访问次数，多个 epoch 的重复访问重复计数，
+但同一样本的 weak/strong 两种增强只算一次。它不是去重聚合样本数。
+JSON/CSV/NPZ 均新增此字段；steps 模式为缺失值，不用步数估算。
+JSON 同时记录 `local_training_mode` 和 `local_epochs`；所有 loss 都是训练过程中的观测，
+不是固定模型上完整数据集的离线 loss。不同客户端数据量不等时，不再让每个尾批拥有完整 batch 的权重。
+各方法原有分组日志仍按客户端平均，应与统一 recorder 的曲线字段区分。
 
 - 记录传入 backward 前、GradScaler 缩放前的目标，包含该方法实际使用的无标签系数和正则项。
 - 不是验证集 CE，不用最后一个 batch 代替整轮均值，也不简单相加两类客户端的均值。
@@ -136,4 +151,6 @@ CSV 也可直接用 pandas 或绘图软件打开。多随机种子的均值/标�
   FedPDM / SAGE-Pure 另用真实图像和 ResNet18 各完成两个客户端的两轮 CPU 小步训练，验证新增统计。
   小步测试把置信阈值设为0以覆盖无标签反向分支，不代表默认配置的收敛结果。
 - CUDA 同步、峰值重置和重复 run 清理已做模拟 API 检查，尚未在真实 GPU / AMP 下验证。
-  正式 CLI 的 CUDA 要求保持不变，这次没有新增 CPU/MPS 训练入口。
+  2026-10-20 的验证没有新增 CPU/MPS 训练入口；2026-10-21 已为 ImageNet-100 的 FedCyon / FedPDM 开放 `--device cpu --amp false`，沿用相同统计记录器。默认仍为 CUDA，MPS 未接入。
+
+- 2026-10-21：项目 `.venv` 下通过正式 `train.py` 入口，各完成 1 轮真实 ImageNet-100 训练，保持默认 20 客户端、每客户端 5 步、batch size 16、4 CPU 线程；初始与最终各评估全部 5000 张验证图像。FedCyon / FedPDM 的训练阶段分别约 108.47 / 97.77 秒，总耗时约 270.98 / 283.10 秒，采样 RSS 峰值约 2925 / 3227 MiB。JSON / CSV / NPZ 的 loss、100 次目标观测、20 个参与客户端、CPU 设备和空 CUDA 指标均检查通过。该短测不代表 200 轮收敛或 CUDA/MPS 验证。原始记录：`outputs/smoke_tests/20261021_cpu_cli_142837/`（Git 忽略，仅保存在本机）。

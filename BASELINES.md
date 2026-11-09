@@ -65,9 +65,16 @@ Semi-Supervised Learning*，AAAI 2025，Algorithm 1 和公式 (4)–(7)。
   不重复样本数**。重复采样不重复计数，不用 `通过率 × 数据集大小` 外推。
   通过率为零时权重为零；整体无贡献时保持原全局模型，避免除零。
 
-论文以完整 local epochs 训练；本项目为保持现有对照预算采用固定 `local_iterations`，
+论文以完整 local epochs 训练；本项目默认仍为固定 `local_iterations`，
 因此默认 5 步时可能只访问无标签客户端的一小部分样本，聚合会偏重有标签端。
 这点及置信阈值 0.95 导致的早期零通过率应通过日志观察，不要通过偷看真实标签修正。
+
+CIFAR-10/SVHN 现在可显式使用 `--local_training_mode epochs --local_epochs E`；
+FedPDM 和 SAGE-Pure 每次参与均完整、无放回遍历自己的数据 E 次，保留尾批。
+FedPDM teacher 与 selected 状态仍每次参与重置一次、而不是每个 epoch 重置；
+prediction memory 继续跨轮保留。多个 epoch 不重复增加聚合样本权重。
+SAGE-Pure 的广播 teacher 在本次参与的所有 epoch 中保持冻结。
+ImageNet-100 保留固定步数，具体命令和计量口径见 README 第 5.4 节。
 
 以下是显式的工程默认值，未宣称全部来自论文附录：
 `ema_m=0.99`、`pdm_prior_ema=0.9`、`pdm_sinkhorn_power=3`、

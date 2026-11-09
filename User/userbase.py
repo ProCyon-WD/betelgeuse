@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import copy
 from experiments.recording import record_training_loss
+from experiments.local_training import uses_local_epochs
 # import needed library
 import os
 import logging
@@ -65,17 +66,17 @@ class User:
 
         self.train_lb_dataloader = loader_dict['train_lb']
         self.train_ulb_dataloader = loader_dict['train_ulb']
-        if loader_dict['train_lb'] is not None and not self.cpu_client_state:
+        if loader_dict['train_lb'] is not None and not self.cpu_client_state and not uses_local_epochs(args):
             self.train_lb_iterator=iter(loader_dict['train_lb'])
-        if loader_dict['train_ulb'] is not None and not self.cpu_client_state:
+        if loader_dict['train_ulb'] is not None and not self.cpu_client_state and not uses_local_epochs(args):
             self.train_ulb_iterator=iter(loader_dict['train_ulb'])
 
         self.local_model = [] if self.cpu_client_state else copy.deepcopy(list(self.model.parameters()))
         self.persionalized_model = [] if self.cpu_client_state else copy.deepcopy(list(self.model.parameters()))
         self.persionalized_model_bar = [] if self.cpu_client_state else copy.deepcopy(list(self.model.parameters()))
 
-    def record_training_loss(self, loss):
-        record_training_loss(self, loss)
+    def record_training_loss(self, loss, sample_count=None):
+        record_training_loss(self, loss, sample_count)
 
     def set_parameters(self, model):
         for old_param, new_param, local_param in zip(self.model.parameters(), model.parameters(), self.local_model):

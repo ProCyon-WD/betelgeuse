@@ -85,11 +85,15 @@ def build_parser(method):
     federated.add_argument("--name_algorithm", default=SERVER_TYPES[method][2], help="Client loss/augmentation algorithm, not server selection")
     federated.add_argument("--runtimes", type=int, default=1)
     federated.add_argument("--num_global_iters", type=int, default=5)
+    federated.add_argument("--local_training_mode", choices=("steps", "epochs"), default="steps",
+                           help="Local budget: fixed minibatch steps (default), or full local epochs for CIFAR-10/SVHN FedCyon/FedPDM/SAGE")
     federated.add_argument("--local_epochs", type=int, default=1)
     federated.add_argument("--local_iterations", type=int, default=5)
     federated.add_argument("--num_total_users", type=int, default=60)
     federated.add_argument("--num_subset_users", type=int, default=12)
-    federated.add_argument("--gpu", type=int, default=0, help="CUDA device index; current server implementations require CUDA")
+    federated.add_argument("--device", choices=("cuda", "cpu"), default="cuda", help="CPU training supports FedCyon/FedPDM on ImageNet-100; MPS is not supported")
+    federated.add_argument("--cpu_threads", type=int, default=4, help="PyTorch intra-op threads for --device cpu")
+    federated.add_argument("--gpu", type=int, default=0, help="CUDA device index for --device cuda; ignored on CPU")
     federated.add_argument("--work_mode", type=int, default=0, choices=range(7))
 
     outputs = parser.add_argument_group("Saving and loading")
@@ -215,6 +219,27 @@ def parse_args(argv=None, method=None):
                             save_name=selected.method + "_" + dataset.lower())
     args = parser.parse_args(argv, namespace=argparse.Namespace(**defaults))
     args.dataset = args.dataset.lower()
+    if args.local_training_mode not in ("steps", "epochs"):
+        parser.error("local_training_mode must be steps or epochs")
+    if args.local_training_mode == "epochs":
+        if args.dataset not in ("cifar10", "svhn") or args.method not in ("fedcyon", "fedpdm", "sage"):
+            parser.error("Local epoch mode supports CIFAR-10/SVHN with FedCyon, FedPDM or SAGE only")
+        if args.local_epochs < 1 or args.batch_size < 1 or args.uratio < 1 or args.num_global_iters < 1:
+            parser.error("Epoch mode requires positive local_epochs, batch sizes and communication rounds")
+        if args.train_sampler != "RandomSampler":
+            parser.error("Epoch mode requires train_sampler=RandomSampler (without replacement)")
+        if args.num_workers < 0:
+            parser.error("num_workers must be nonnegative")
+        if args.method == "fedcyon" and (args.num_total_users not in (20, 50, 100)
+                                        or not 2 <= args.num_subset_users <= args.num_total_users):
+            parser.error("Small-image FedCyon epoch mode requires 20, 50 or 100 total clients and 2 <= num_subset_users <= num_total_users")
+    if args.device not in ("cuda", "cpu") or args.cpu_threads < 1:
+        parser.error("device must be cuda or cpu, and cpu_threads must be positive")
+    if args.device == "cpu":
+        if args.dataset != "imagenet100" or args.method not in ("fedcyon", "fedpdm"):
+            parser.error("--device cpu currently supports FedCyon/FedPDM on ImageNet-100 only")
+        if args.amp:
+            parser.error("--device cpu requires --amp false; CPU mixed precision is not supported")
     if args.partition_file is not None and str(args.partition_file).lower() in ("none", "null", ""):
         args.partition_file = None
     if args.runtimes < 1 or args.num_total_users < 1:
@@ -261,7 +286,7 @@ def parse_args(argv=None, method=None):
             parser.error("Indexed data paths require 2 <= num_subset_users <= num_total_users")
         if args.partition not in ("homo", "noniid-labeldir") or not math.isfinite(args.beta) or args.beta <= 0:
             parser.error("Indexed data paths require partition=homo or noniid-labeldir and finite beta > 0")
-        if any(value < 1 for value in (args.num_global_iters, args.local_iterations, args.batch_size,
+        if (args.local_training_mode == "steps" and args.local_iterations < 1) or any(value < 1 for value in (args.num_global_iters, args.batch_size,
                                       args.uratio, args.eval_batch_size, args.eval_interval, args.min_client_samples)):
             parser.error("Iteration counts, batch sizes, eval_interval and min_client_samples must be positive")
         if args.num_workers < 0 or not 0 <= args.partition_seed < 2 ** 32:
@@ -275,8 +300,8 @@ def parse_args(argv=None, method=None):
     elif args.prepare_data:
         parser.error("--prepare-data supports ImageNet-100 and FedPDM/SAGE CIFAR-10/SVHN")
     if indexed_backend(args) and args.method != "fedcyon":
-        if args.aggregate_method_server != "FedAvg" or args.local_epochs != 1:
-            parser.error("New baselines use method-specific weighted averaging and a fixed local_iterations budget; set aggregate_method_server=FedAvg and local_epochs=1")
+        if args.aggregate_method_server != "FedAvg" or (args.local_training_mode == "steps" and args.local_epochs != 1):
+            parser.error("New baselines require aggregate_method_server=FedAvg; steps mode requires local_epochs=1")
         if args.method in ("fedpdm", "sage") and args.hard_label != (args.method == "fedpdm"):
             parser.error("FedPDM requires hard_label=true; SAGE requires hard_label=false")
         if not all(math.isfinite(value) for value in (args.lr, args.weight_decay, args.momentum,

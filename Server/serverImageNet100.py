@@ -15,6 +15,7 @@ from datautils.data_utils.dataset import BasicDataset
 from datautils.imagenet100 import ImageNet100Dataset, imagenet100_transforms, prepare_imagenet100
 from datautils.partition_store import atomic_output
 from experiments.paths import project_path
+from experiments.local_training import local_loader_options
 
 
 class ImageNet100FedCyon(Server):
@@ -34,7 +35,7 @@ class ImageNet100FedCyon(Server):
         self.model = copy.deepcopy(instance_model).to(device)
         self.loader_dict_eval["eval"] = torch.utils.data.DataLoader(
             evaluation, batch_size=args.eval_batch_size, shuffle=False,
-            num_workers=args.num_workers, pin_memory=True)
+            num_workers=args.num_workers, pin_memory=device.type == "cuda")
         for client_id, training in enumerate(training_sets):
             labeled = BasicDataset("fixmatch", training.images, training.targets, args.num_classes, weak,
                                    basic_transform=basic)
@@ -43,8 +44,8 @@ class ImageNet100FedCyon(Server):
             tag = 0 if client_id < args.num_labeled_users else 2
             loader = get_data_loader(labeled if tag == 0 else unlabeled,
                                      args.batch_size if tag == 0 else args.batch_size * args.uratio,
-                                     num_iters=args.local_iterations, data_sampler=args.train_sampler,
-                                     num_workers=args.num_workers, pin_memory=True)
+                                     **local_loader_options(args, args.local_iterations), data_sampler=args.train_sampler,
+                                     num_workers=args.num_workers, pin_memory=device.type == "cuda")
             loaders = {"train_lb": loader if tag == 0 else None,
                        "train_ulb": loader if tag == 2 else None}
             user = self._create_user(client_id, tag, labeled, unlabeled, loaders, instance_model)
